@@ -596,10 +596,10 @@ class KittiViewer(QMainWindow):
         h_layout.addWidget(self.w_build_net)
         h_layout.addWidget(self.w_load_ckpt)
         control_panel_layout.addLayout(h_layout)
-        self.w_inference = QPushButton('Inferenct Network')
+        self.w_inference = QPushButton('Inference Network')
         self.w_inference.clicked.connect(self.on_InferenceVxNetPressed)
         control_panel_layout.addWidget(self.w_inference)
-        self.w_load_infer = QPushButton('Load and Inferenct Network')
+        self.w_load_infer = QPushButton('Load and Inference Network')
         self.w_load_infer.clicked.connect(self.on_LoadInferenceVxNetPressed)
         control_panel_layout.addWidget(self.w_load_infer)
         # self.w_eval_net = QPushButton('Evaluation VoxelNet')
@@ -987,7 +987,8 @@ class KittiViewer(QMainWindow):
         if self.kitti_info is None:
             self.error("you must load infos and choose a existing image idx first.")
             return
-
+        if self.gt_boxes is None:
+            return
         rect = self.kitti_info['calib/R0_rect']
         P2 = self.kitti_info['calib/P2']
         Trv2c = self.kitti_info['calib/Tr_velo_to_cam']
@@ -1203,6 +1204,11 @@ class KittiViewer(QMainWindow):
             
             if 'group_ids' in annos:
                 self.group_ids = annos['group_ids'][:num_obj]
+        else:
+            self.gt_boxes = None
+            self.gt_names = None
+            self.difficulty = None
+            self.group_ids = None
         if self.w_config.get("EnableSample"):
             self.sample_to_current_data()
         if self.w_config.get("EnableAugmentation"):
