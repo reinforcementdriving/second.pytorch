@@ -3,7 +3,7 @@ SECOND detector. Based on my unofficial implementation of VoxelNet with some imp
 
 ONLY support python 3.6+, pytorch 0.4.1+. Don't support pytorch 0.4.0. Tested in Ubuntu 16.04/18.04.
 
-Feel free to contact me by issue or email if encounter any problems. I don't know whether this project is runnable in other computer.
+* Ubuntu 18.04 have speed problem in my environment and may can't build/usr SparseConvNet.
 
 ### Performance in KITTI validation set (50/50 split, people have problems, need to be tuned.)
 
@@ -34,7 +34,7 @@ cd ./second.pytorch/second
 It is recommend to use Anaconda package manager.
 
 ```bash
-pip install shapely fire pybind11 pyqtgraph tensorboardX protobuf
+pip install shapely fire pybind11 tensorboardX protobuf scikit-image numba pillow
 ```
 
 If you don't have Anaconda:
@@ -191,18 +191,57 @@ output.features = SubmanifoldConvolutionFunction.apply(
 
 You can download pretrained models in [google drive](https://drive.google.com/open?id=1eblyuILwbxkJXfIP5QlALW5N_x5xJZhL). The car model is corresponding to car.config, the car_tiny model is corresponding to car.tiny.config and the people model is corresponding to people.config.
 
-## Try Kitti Viewer (Unstable)
+## Docker
+
+You can use a prebuilt docker for testing:
+```
+docker pull scrin/second-pytorch 
+```
+Then run:
+```
+nvidia-docker run -it --rm -v /media/yy/960evo/datasets/:/root/data -v $HOME/pretrained_models:/root/model --ipc=host second-pytorch:latest
+python ./pytorch/train.py evaluate --config_path=./configs/car.config --model_dir=/root/model/car
+...
+```
+
+Currently there is a problem that training and evaluating in docker is very slow.
+
+## Try Kitti Viewer Web
+
+### Major step
+
+1. run ```python ./kittiviewer/backend.py main --port=xxxx``` in your server/local.
+
+2. run ```cd ./kittiviewer/frontend && python -m http.server``` to launch a local web server.
+
+3. open your browser and enter your frontend url (e.g. http://127.0.0.1:8000, default]).
+
+4. input backend url (e.g. http://127.0.0.1:16666)
+
+5. input root path, info path and det path (optional)
+
+6. click load, loadDet (optional), input image index in center bottom of screen and press Enter.
+
+### Inference step
+
+Firstly the load button must be clicked and load successfully.
+
+1. input checkpointPath and configPath.
+
+2. click buildNet.
+
+3. click inference.
+
+![GuidePic](https://raw.githubusercontent.com/traveller59/second.pytorch/master/images/viewerweb.png)
+
+
+
+## Try Kitti Viewer (Deprecated)
 
 You should use kitti viewer based on pyqt and pyqtgraph to check data before training.
 
 run ```python ./kittiviewer/viewer.py```, check following picture to use kitti viewer:
 ![GuidePic](https://raw.githubusercontent.com/traveller59/second.pytorch/master/images/simpleguide.png)
-
-## TODO
-
-- [ ] add unit tests (2018.10~2018.11).
-- [ ] add a self-hosted CI (2018.10~2018.12).
-- [ ] replace pyqtgraph with modernGL or other draw tools (2018.11~2019.1).
 
 ## Concepts
 
