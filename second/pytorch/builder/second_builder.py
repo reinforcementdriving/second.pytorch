@@ -1,3 +1,17 @@
+# Copyright 2017 yanyan. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """VoxelNet builder.
 """
 
@@ -19,12 +33,11 @@ def build(model_cfg: second_pb2.VoxelNet, voxel_generator,
     num_class = len(target_assigner.classes)
 
     num_input_features = model_cfg.num_point_features
-    if model_cfg.without_reflectivity:
-        num_input_features = 3
     loss_norm_type_dict = {
         0: LossNormType.NormByNumExamples,
         1: LossNormType.NormByNumPositives,
         2: LossNormType.NormByNumPosNeg,
+        3: LossNormType.DontNorm,
     }
     loss_norm_type = loss_norm_type_dict[model_cfg.loss_norm_type]
 
@@ -54,7 +67,6 @@ def build(model_cfg: second_pb2.VoxelNet, voxel_generator,
         rpn_upsample_strides=list(model_cfg.rpn.upsample_strides),
         rpn_num_upsample_filters=list(model_cfg.rpn.num_upsample_filters),
         use_norm=True,
-        use_voxel_classifier=model_cfg.use_aux_classifier,
         use_rotate_nms=model_cfg.use_rotate_nms,
         multiclass_nms=model_cfg.use_multi_class_nms,
         nms_score_threshold=model_cfg.nms_score_threshold,
@@ -62,10 +74,8 @@ def build(model_cfg: second_pb2.VoxelNet, voxel_generator,
         nms_post_max_size=model_cfg.nms_post_max_size,
         nms_iou_threshold=model_cfg.nms_iou_threshold,
         use_sigmoid_score=model_cfg.use_sigmoid_score,
-        use_sparse_rpn=False,
         encode_background_as_zeros=model_cfg.encode_background_as_zeros,
         use_direction_classifier=model_cfg.use_direction_classifier,
-        use_bev=model_cfg.use_bev,
         num_input_features=num_input_features,
         num_groups=model_cfg.rpn.num_groups,
         use_groupnorm=model_cfg.rpn.use_groupnorm,
@@ -81,5 +91,7 @@ def build(model_cfg: second_pb2.VoxelNet, voxel_generator,
         cls_loss_ftor=cls_loss_ftor,
         target_assigner=target_assigner,
         measure_time=measure_time,
+        voxel_generator=voxel_generator,
+        post_center_range=list(model_cfg.post_center_limit_range),
     )
     return net

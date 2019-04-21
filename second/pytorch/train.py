@@ -1,86 +1,76 @@
+import copy
+import json
 import os
-import pathlib
+from pathlib import Path
 import pickle
 import shutil
 import time
-from functools import partial
-import json 
+
 import fire
 import numpy as np
 import torch
 from google.protobuf import text_format
-from tensorboardX import SummaryWriter
 
-import torchplus
 import second.data.kitti_common as kitti
+import torchplus
 from second.builder import target_assigner_builder, voxel_builder
-from second.data.preprocess import merge_second_batch
+from second.core import box_np_ops
+from second.data.preprocess import merge_second_batch, merge_second_batch_multigpu
 from second.protos import pipeline_pb2
 from second.pytorch.builder import (box_coder_builder, input_reader_builder,
-                                      lr_scheduler_builder, optimizer_builder,
-                                      second_builder)
-from second.utils.eval import get_coco_eval_result, get_official_eval_result
+                                    lr_scheduler_builder, optimizer_builder,
+                                    second_builder)
+from second.utils.log_tool import SimpleModelLog
 from second.utils.progress_bar import ProgressBar
-
-
-def _get_pos_neg_loss(cls_loss, labels):
-    # cls_loss: [N, num_anchors, num_class]
-    # labels: [N, num_anchors]
-    batch_size = cls_loss.shape[0]
-    if cls_loss.shape[-1] == 1 or len(cls_loss.shape) == 2:
-        cls_pos_loss = (labels > 0).type_as(cls_loss) * cls_loss.view(
-            batch_size, -1)
-        cls_neg_loss = (labels == 0).type_as(cls_loss) * cls_loss.view(
-            batch_size, -1)
-        cls_pos_loss = cls_pos_loss.sum() / batch_size
-        cls_neg_loss = cls_neg_loss.sum() / batch_size
-    else:
-        cls_pos_loss = cls_loss[..., 1:].sum() / batch_size
-        cls_neg_loss = cls_loss[..., 0].sum() / batch_size
-    return cls_pos_loss, cls_neg_loss
-
-
-def _flat_nested_json_dict(json_dict, flatted, sep=".", start=""):
-    for k, v in json_dict.items():
-        if isinstance(v, dict):
-            _flat_nested_json_dict(v, flatted, sep, start + sep + k)
-        else:
-            flatted[start + sep + k] = v
-
-
-def flat_nested_json_dict(json_dict, sep=".") -> dict:
-    """flat a nested json-like dict. this function make shadow copy.
-    """
-    flatted = {}
-    for k, v in json_dict.items():
-        if isinstance(v, dict):
-            _flat_nested_json_dict(v, flatted, sep, k)
-        else:
-            flatted[k] = v
-    return flatted
-
+import psutil
 
 def example_convert_to_torch(example, dtype=torch.float32,
                              device=None) -> dict:
     device = device or torch.device("cuda:0")
     example_torch = {}
     float_names = [
-        "voxels", "anchors", "reg_targets", "reg_weights", "bev_map", "rect",
-        "Trv2c", "P2"
+        "voxels", "anchors", "reg_targets", "reg_weights", "bev_map"
     ]
-
     for k, v in example.items():
         if k in float_names:
-            example_torch[k] = torch.tensor(v, dtype=torch.float32, device=device).to(dtype)
+            # slow when directly provide fp32 data with dtype=torch.half
+            example_torch[k] = torch.tensor(
+                v, dtype=torch.float32, device=device).to(dtype)
         elif k in ["coordinates", "labels", "num_points"]:
             example_torch[k] = torch.tensor(
                 v, dtype=torch.int32, device=device)
         elif k in ["anchors_mask"]:
             example_torch[k] = torch.tensor(
                 v, dtype=torch.uint8, device=device)
+        elif k == "calib":
+            calib = {}
+            for k1, v1 in v.items():
+                calib[k1] = torch.tensor(
+                    v1, dtype=dtype, device=device).to(dtype)
+            example_torch[k] = calib
+        elif k == "num_voxels":
+            example_torch[k] = torch.tensor(v, device=device)
         else:
             example_torch[k] = v
     return example_torch
+
+
+def build_network(model_cfg, measure_time=False):
+    voxel_generator = voxel_builder.build(model_cfg.voxel_generator)
+    bv_range = voxel_generator.point_cloud_range[[0, 1, 3, 4]]
+    box_coder = box_coder_builder.build(model_cfg.box_coder)
+    target_assigner_cfg = model_cfg.target_assigner
+    target_assigner = target_assigner_builder.build(target_assigner_cfg,
+                                                    bv_range, box_coder)
+    net = second_builder.build(
+        model_cfg, voxel_generator, target_assigner, measure_time=measure_time)
+    return net
+
+
+def _worker_init_fn(worker_id):
+    time_seed = np.array(time.time(), dtype=np.int32)
+    np.random.seed(time_seed + worker_id)
+    print(f"WORKER {worker_id} seed:", np.random.get_state()[1][0])
 
 
 def train(config_path,
@@ -89,95 +79,118 @@ def train(config_path,
           create_folder=False,
           display_step=50,
           summary_step=5,
-          pickle_result=True,
-          patchs=None):
+          pretrained_path=None,
+          multi_gpu=False,
+          num_gpu=None,
+          resume=False):
     """train a VoxelNet model specified by a config file.
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model_dir = str(Path(model_dir).resolve())
     if create_folder:
-        if pathlib.Path(model_dir).exists():
+        if Path(model_dir).exists():
             model_dir = torchplus.train.create_folder(model_dir)
-    patchs = patchs or []
-    model_dir = pathlib.Path(model_dir)
+    model_dir = Path(model_dir)
+    if not resume and model_dir.exists():
+        raise ValueError("model dir exists and you don't specify resume.")
     model_dir.mkdir(parents=True, exist_ok=True)
     if result_path is None:
         result_path = model_dir / 'results'
     config_file_bkp = "pipeline.config"
-    config = pipeline_pb2.TrainEvalPipelineConfig()
-    with open(config_path, "r") as f:
-        proto_str = f.read()
-        text_format.Merge(proto_str, config)
-    for patch in patchs:
-        patch = "config." + patch 
-        exec(patch)
-    shutil.copyfile(config_path, str(model_dir / config_file_bkp))
+    if isinstance(config_path, str):
+        # directly provide a config object. this usually used
+        # when you want to train with several different parameters in
+        # one script.
+        config = pipeline_pb2.TrainEvalPipelineConfig()
+        with open(config_path, "r") as f:
+            proto_str = f.read()
+            text_format.Merge(proto_str, config)
+    else:
+        config = config_path
+        proto_str = text_format.MessageToString(config, indent=2)
+    with (model_dir / config_file_bkp).open("w") as f:
+        f.write(proto_str)
+
     input_cfg = config.train_input_reader
     eval_input_cfg = config.eval_input_reader
     model_cfg = config.model.second
     train_cfg = config.train_config
 
-    
-    ######################
-    # BUILD VOXEL GENERATOR
-    ######################
-    voxel_generator = voxel_builder.build(model_cfg.voxel_generator)
-    ######################
-    # BUILD TARGET ASSIGNER
-    ######################
-    bv_range = voxel_generator.point_cloud_range[[0, 1, 3, 4]]
-    box_coder = box_coder_builder.build(model_cfg.box_coder)
-    target_assigner_cfg = model_cfg.target_assigner
-    target_assigner = target_assigner_builder.build(target_assigner_cfg,
-                                                    bv_range, box_coder)
+    net = build_network(model_cfg).to(device)
+    # if train_cfg.enable_mixed_precision:
+    #     net.half()
+    #     net.metrics_to_float()
+    #     net.convert_norm_to_float(net)
+    target_assigner = net.target_assigner
+    voxel_generator = net.voxel_generator
     class_names = target_assigner.classes
-    ######################
-    # BUILD NET
-    ######################
-    center_limit_range = model_cfg.post_center_limit_range
-    net = second_builder.build(model_cfg, voxel_generator, target_assigner)
-    net.cuda()
-    # net_train = torch.nn.DataParallel(net).cuda()
+
+    
     print("num_trainable parameters:", len(list(net.parameters())))
     # for n, p in net.named_parameters():
     #     print(n, p.shape)
-    ######################
-    # BUILD OPTIMIZER
-    ######################
     # we need global_step to create lr_scheduler, so restore net first.
     torchplus.train.try_restore_latest_checkpoints(model_dir, [net])
+    if pretrained_path is not None:
+        net.load_state_dict(torch.load(pretrained_path))
+        net.clear_global_step()
+        net.clear_metrics()
+    if multi_gpu:
+        net_parallel = torch.nn.DataParallel(net)
+    else:
+        net_parallel = net
     gstep = net.get_global_step() - 1
     optimizer_cfg = train_cfg.optimizer
-    if train_cfg.enable_mixed_precision:
-        net.half()
-        net.metrics_to_float()
-        net.convert_norm_to_float(net)
     loss_scale = train_cfg.loss_scale_factor
-    mixed_optimizer = optimizer_builder.build(optimizer_cfg, net, mixed=train_cfg.enable_mixed_precision, loss_scale=loss_scale)
-    optimizer = mixed_optimizer
-    """
+    fastai_optimizer = optimizer_builder.build(
+        optimizer_cfg,
+        net,
+        mixed=False,
+        loss_scale=loss_scale)
     if train_cfg.enable_mixed_precision:
-        mixed_optimizer = torchplus.train.MixedPrecisionWrapper(
-            optimizer, loss_scale)
+        max_num_voxels = input_cfg.preprocess.max_number_of_voxels * input_cfg.batch_size
+        assert max_num_voxels < 65535, "spconv fp16 training only support this"
+        from apex import amp
+        net, amp_optimizer = amp.initialize(net, fastai_optimizer,
+                                        opt_level="O2",
+                                        keep_batchnorm_fp32=True,
+                                        loss_scale=loss_scale
+                                        )
+        net.metrics_to_float()
     else:
-        mixed_optimizer = optimizer
-    """
-    # must restore optimizer AFTER using MixedPrecisionWrapper
+        amp_optimizer = fastai_optimizer
+    center_limit_range = model_cfg.post_center_limit_range
     torchplus.train.try_restore_latest_checkpoints(model_dir,
-                                                   [mixed_optimizer])
-    lr_scheduler = lr_scheduler_builder.build(optimizer_cfg, optimizer, train_cfg.steps)
+                                                   [fastai_optimizer])
+    lr_scheduler = lr_scheduler_builder.build(optimizer_cfg, amp_optimizer,
+                                              train_cfg.steps)
     if train_cfg.enable_mixed_precision:
         float_dtype = torch.float16
     else:
         float_dtype = torch.float32
+
+    if multi_gpu:
+        if num_gpu is None:
+            num_gpu = torch.cuda.device_count()
+        else:
+            assert num_gpu < torch.cuda.device_count()
+        print(f"MULTI-GPU: use {num_gpu} gpu")
+        collate_fn = merge_second_batch_multigpu
+    else:
+        collate_fn = merge_second_batch
+        num_gpu = 1
+
     ######################
     # PREPARE INPUT
     ######################
-
     dataset = input_reader_builder.build(
         input_cfg,
         model_cfg,
         training=True,
         voxel_generator=voxel_generator,
-        target_assigner=target_assigner)
+        target_assigner=target_assigner,
+        multi_gpu=multi_gpu)
     eval_dataset = input_reader_builder.build(
         eval_input_cfg,
         model_cfg,
@@ -185,44 +198,30 @@ def train(config_path,
         voxel_generator=voxel_generator,
         target_assigner=target_assigner)
 
-    def _worker_init_fn(worker_id):
-        time_seed = np.array(time.time(), dtype=np.int32)
-        np.random.seed(time_seed + worker_id)
-        print(f"WORKER {worker_id} seed:", np.random.get_state()[1][0])
-
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=input_cfg.batch_size,
+        batch_size=input_cfg.batch_size * num_gpu,
         shuffle=True,
-        num_workers=input_cfg.num_workers,
+        num_workers=input_cfg.preprocess.num_workers,
         pin_memory=False,
-        collate_fn=merge_second_batch,
+        collate_fn=collate_fn,
         worker_init_fn=_worker_init_fn)
     eval_dataloader = torch.utils.data.DataLoader(
         eval_dataset,
-        batch_size=eval_input_cfg.batch_size,
+        batch_size=eval_input_cfg.batch_size, # only support multi-gpu train
         shuffle=False,
-        num_workers=eval_input_cfg.num_workers,
+        num_workers=eval_input_cfg.preprocess.num_workers,
         pin_memory=False,
         collate_fn=merge_second_batch)
-    
+
     data_iter = iter(dataloader)
 
     ######################
     # TRAINING
     ######################
-    training_detail = []
-    log_path = model_dir / 'log.txt'
-    training_detail_path = model_dir / 'log.json'
-    if training_detail_path.exists():
-        with open(training_detail_path, 'r') as f:
-            training_detail = json.load(f)
-    logf = open(log_path, 'a')
-    logf.write(proto_str)
-    logf.write("\n")
-    summary_dir = model_dir / 'summary'
-    summary_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(str(summary_dir))
+    model_logging = SimpleModelLog(model_dir)
+    model_logging.open()
+    model_logging.log_text(proto_str + "\n", 0, tag="config")
 
     total_step_elapsed = 0
     remain_steps = train_cfg.steps - net.get_global_step()
@@ -235,7 +234,8 @@ def train(config_path,
 
     if train_cfg.steps % train_cfg.steps_per_eval == 0:
         total_loop -= 1
-    mixed_optimizer.zero_grad()
+    amp_optimizer.zero_grad()
+    step_times = []
     try:
         for _ in range(total_loop):
             if total_step_elapsed + train_cfg.steps_per_eval > train_cfg.steps:
@@ -252,13 +252,11 @@ def train(config_path,
                         net.clear_metrics()
                     data_iter = iter(dataloader)
                     example = next(data_iter)
-                example_torch = example_convert_to_torch(example, float_dtype)
+                example_torch = example_convert_to_torch(example, float_dtype, device)
 
                 batch_size = example["anchors"].shape[0]
 
-                ret_dict = net(example_torch)
-
-                # box_preds = ret_dict["box_preds"]
+                ret_dict = net_parallel(example_torch)
                 cls_preds = ret_dict["cls_preds"]
                 loss = ret_dict["loss"].mean()
                 cls_loss_reduced = ret_dict["cls_loss_reduced"].mean()
@@ -267,21 +265,24 @@ def train(config_path,
                 cls_neg_loss = ret_dict["cls_neg_loss"]
                 loc_loss = ret_dict["loc_loss"]
                 cls_loss = ret_dict["cls_loss"]
-                dir_loss_reduced = ret_dict["dir_loss_reduced"]
+                dir_loss_reduced = ret_dict["dir_loss_reduced"].mean()
                 cared = ret_dict["cared"]
                 labels = example_torch["labels"]
                 if train_cfg.enable_mixed_precision:
-                    loss *= loss_scale
-                loss.backward()
+                    with amp.scale_loss(loss, amp_optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
-                mixed_optimizer.step()
-                mixed_optimizer.zero_grad()
+                amp_optimizer.step()
+                amp_optimizer.zero_grad()
                 net.update_global_step()
                 net_metrics = net.update_metrics(cls_loss_reduced,
                                                  loc_loss_reduced, cls_preds,
                                                  labels, cared)
 
                 step_time = (time.time() - t)
+                step_times.append(step_time)
                 t = time.time()
                 metrics = {}
                 num_pos = int((labels > 0)[0].float().sum().cpu().numpy())
@@ -296,11 +297,12 @@ def train(config_path,
                         float(loc_loss[:, :, i].sum().detach().cpu().numpy() /
                               batch_size) for i in range(loc_loss.shape[-1])
                     ]
-                    metrics["type"] = "step_info"
-                    metrics["step"] = global_step
-                    metrics["steptime"] = step_time
+                    metrics["runtime"] = {
+                        "step": global_step,
+                        "steptime": np.mean(step_times),
+                    }
+                    step_times = []
                     metrics.update(net_metrics)
-                    metrics["loss"] = {}
                     metrics["loss"]["loc_elem"] = loc_loss_elem
                     metrics["loss"]["cls_pos_rt"] = float(
                         cls_pos_loss.detach().cpu().numpy())
@@ -309,297 +311,123 @@ def train(config_path,
                     if model_cfg.use_direction_classifier:
                         metrics["loss"]["dir_rt"] = float(
                             dir_loss_reduced.detach().cpu().numpy())
-                    metrics["num_vox"] = int(example_torch["voxels"].shape[0])
-                    metrics["num_pos"] = int(num_pos)
-                    metrics["num_neg"] = int(num_neg)
-                    metrics["num_anchors"] = int(num_anchors)
-                    # metrics["lr"] = float(
-                    #     mixed_optimizer.param_groups[0]['lr'])
-                    metrics["lr"] = float(
-                        optimizer.lr)
 
-                    metrics["image_idx"] = example['image_idx'][0]
-                    training_detail.append(metrics)
-                    flatted_metrics = flat_nested_json_dict(metrics)
-                    flatted_summarys = flat_nested_json_dict(metrics, "/")
-                    """
-                    for k, v in flatted_summarys.items():
-                        if isinstance(v, (list, tuple)):
-                            v = {str(i): e for i, e in enumerate(v)}
-                            writer.add_scalars(k, v, global_step)
-                        else:
-                            writer.add_scalar(k, v, global_step)
-                    """
-                    metrics_str_list = []
-                    for k, v in flatted_metrics.items():
-                        if isinstance(v, float):
-                            metrics_str_list.append(f"{k}={v:.3}")
-                        elif isinstance(v, (list, tuple)):
-                            if v and isinstance(v[0], float):
-                                v_str = ', '.join([f"{e:.3}" for e in v])
-                                metrics_str_list.append(f"{k}=[{v_str}]")
-                            else:
-                                metrics_str_list.append(f"{k}={v}")
-                        else:
-                            metrics_str_list.append(f"{k}={v}")
-                    log_str = ', '.join(metrics_str_list)
-                    print(log_str, file=logf)
-                    print(log_str)
+                    metrics["misc"] = {
+                        "num_vox": int(example_torch["voxels"].shape[0]),
+                        "num_pos": int(num_pos),
+                        "num_neg": int(num_neg),
+                        "num_anchors": int(num_anchors),
+                        "lr": float(amp_optimizer.lr),
+                        "mem_usage": psutil.virtual_memory().percent,
+                    }
+                    # metrics["lr"] = float(
+                    #     fastai_optimizer.param_groups[0]['lr'])
+                    model_logging.log_metrics(metrics, global_step)
+
                 ckpt_elasped_time = time.time() - ckpt_start_time
                 if ckpt_elasped_time > train_cfg.save_checkpoints_secs:
-                    torchplus.train.save_models(model_dir, [net, optimizer],
+                    torchplus.train.save_models(model_dir, [net, amp_optimizer],
                                                 net.get_global_step())
                     ckpt_start_time = time.time()
             total_step_elapsed += steps
-            torchplus.train.save_models(model_dir, [net, optimizer],
+            torchplus.train.save_models(model_dir, [net, amp_optimizer],
                                         net.get_global_step())
             net.eval()
             result_path_step = result_path / f"step_{net.get_global_step()}"
             result_path_step.mkdir(parents=True, exist_ok=True)
-            print("#################################")
-            print("#################################", file=logf)
-            print("# EVAL")
-            print("# EVAL", file=logf)
-            print("#################################")
-            print("#################################", file=logf)
-            print("Generate output labels...")
-            print("Generate output labels...", file=logf)
+            model_logging.log_text("#################################",
+                                   global_step)
+            model_logging.log_text("# EVAL", global_step)
+            model_logging.log_text("#################################",
+                                   global_step)
+            model_logging.log_text("Generate output labels...", global_step)
             t = time.time()
-            dt_annos = []
+            detections = []
             prog_bar = ProgressBar()
             net.clear_timer()
-            prog_bar.start((len(eval_dataset) + eval_input_cfg.batch_size - 1) // eval_input_cfg.batch_size)
+            prog_bar.start((len(eval_dataset) + eval_input_cfg.batch_size - 1)
+                           // eval_input_cfg.batch_size)
             for example in iter(eval_dataloader):
                 example = example_convert_to_torch(example, float_dtype)
-                if pickle_result:
-                    dt_annos += predict_kitti_to_anno(
-                        net, example, class_names, center_limit_range,
-                        model_cfg.lidar_input)
-                else:
-                    _predict_kitti_to_file(net, example, result_path_step,
-                                           class_names, center_limit_range,
-                                           model_cfg.lidar_input)
-
+                detections += net(example)
                 prog_bar.print_bar()
 
             sec_per_ex = len(eval_dataset) / (time.time() - t)
-            
-            print(f'generate label finished({sec_per_ex:.2f}/s). start eval:')
-            print(
+            model_logging.log_text(
                 f'generate label finished({sec_per_ex:.2f}/s). start eval:',
-                file=logf)
-            gt_annos = [
-                info["annos"] for info in eval_dataset.dataset.kitti_infos
-            ]
-            if not pickle_result:
-                dt_annos = kitti.get_label_annos(result_path_step)
-            # result = get_official_eval_result_v2(gt_annos, dt_annos, class_names)
-            # print(json.dumps(result, indent=2), file=logf)
-            result = get_official_eval_result(gt_annos, dt_annos, class_names)
-            print(result, file=logf)
-            print(result)
-            writer.add_text('eval_result', json.dumps(result, indent=2), global_step)
-            result = get_coco_eval_result(gt_annos, dt_annos, class_names)
-            print(result, file=logf)
-            print(result)
-            if pickle_result:
-                with open(result_path_step / "result.pkl", 'wb') as f:
-                    pickle.dump(dt_annos, f)
-            writer.add_text('eval_result', result, global_step)
+                global_step)
+            result_dict = eval_dataset.dataset.evaluation(
+                detections, str(result_path_step))
+            for k, v in result_dict["results"].items():
+                model_logging.log_text("Evaluation {}".format(k), global_step)
+                model_logging.log_text(v, global_step)
+            model_logging.log_metrics(result_dict["detail"], global_step)
+            with open(result_path_step / "result.pkl", 'wb') as f:
+                pickle.dump(detections, f)
             net.train()
     except Exception as e:
-        torchplus.train.save_models(model_dir, [net, optimizer],
+        torchplus.train.save_models(model_dir, [net, amp_optimizer],
                                     net.get_global_step())
-        logf.close()
         raise e
+    finally:
+        model_logging.close()
     # save model before exit
-    torchplus.train.save_models(model_dir, [net, optimizer],
+    torchplus.train.save_models(model_dir, [net, amp_optimizer],
                                 net.get_global_step())
-    logf.close()
-
-
-def _predict_kitti_to_file(net,
-                           example,
-                           result_save_path,
-                           class_names,
-                           center_limit_range=None,
-                           lidar_input=False):
-    batch_image_shape = example['image_shape']
-    batch_imgidx = example['image_idx']
-    predictions_dicts = net(example)
-    # t = time.time()
-    for i, preds_dict in enumerate(predictions_dicts):
-        image_shape = batch_image_shape[i]
-        img_idx = preds_dict["image_idx"]
-        if preds_dict["bbox"] is not None or preds_dict["bbox"].size.numel():
-            box_2d_preds = preds_dict["bbox"].data.cpu().numpy()
-            box_preds = preds_dict["box3d_camera"].data.cpu().numpy()
-            scores = preds_dict["scores"].data.cpu().numpy()
-            box_preds_lidar = preds_dict["box3d_lidar"].data.cpu().numpy()
-            # write pred to file
-            box_preds = box_preds[:, [0, 1, 2, 4, 5, 3,
-                                      6]]  # lhw->hwl(label file format)
-            label_preds = preds_dict["label_preds"].data.cpu().numpy()
-            # label_preds = np.zeros([box_2d_preds.shape[0]], dtype=np.int32)
-            result_lines = []
-            for box, box_lidar, bbox, score, label in zip(
-                    box_preds, box_preds_lidar, box_2d_preds, scores,
-                    label_preds):
-                if not lidar_input:
-                    if bbox[0] > image_shape[1] or bbox[1] > image_shape[0]:
-                        continue
-                    if bbox[2] < 0 or bbox[3] < 0:
-                        continue
-                # print(img_shape)
-                if center_limit_range is not None:
-                    limit_range = np.array(center_limit_range)
-                    if (np.any(box_lidar[:3] < limit_range[:3])
-                            or np.any(box_lidar[:3] > limit_range[3:])):
-                        continue
-                bbox[2:] = np.minimum(bbox[2:], image_shape[::-1])
-                bbox[:2] = np.maximum(bbox[:2], [0, 0])
-                result_dict = {
-                    'name': class_names[int(label)],
-                    'alpha': -np.arctan2(-box_lidar[1], box_lidar[0]) + box[6],
-                    'bbox': bbox,
-                    'location': box[:3],
-                    'dimensions': box[3:6],
-                    'rotation_y': box[6],
-                    'score': score,
-                }
-                result_line = kitti.kitti_result_line(result_dict)
-                result_lines.append(result_line)
-        else:
-            result_lines = []
-        result_file = f"{result_save_path}/{kitti.get_image_index_str(img_idx)}.txt"
-        result_str = '\n'.join(result_lines)
-        with open(result_file, 'w') as f:
-            f.write(result_str)
-
-
-def predict_kitti_to_anno(net,
-                          example,
-                          class_names,
-                          center_limit_range=None,
-                          lidar_input=False,
-                          global_set=None):
-    batch_image_shape = example['image_shape']
-    batch_imgidx = example['image_idx']
-    predictions_dicts = net(example)
-    # t = time.time()
-    annos = []
-    for i, preds_dict in enumerate(predictions_dicts):
-        image_shape = batch_image_shape[i]
-        img_idx = preds_dict["image_idx"]
-        if preds_dict["bbox"] is not None or preds_dict["bbox"].size.numel() != 0:
-            box_2d_preds = preds_dict["bbox"].detach().cpu().numpy()
-            box_preds = preds_dict["box3d_camera"].detach().cpu().numpy()
-            scores = preds_dict["scores"].detach().cpu().numpy()
-            box_preds_lidar = preds_dict["box3d_lidar"].detach().cpu().numpy()
-            # write pred to file
-            label_preds = preds_dict["label_preds"].detach().cpu().numpy()
-            # label_preds = np.zeros([box_2d_preds.shape[0]], dtype=np.int32)
-            anno = kitti.get_start_result_anno()
-            num_example = 0
-            for box, box_lidar, bbox, score, label in zip(
-                    box_preds, box_preds_lidar, box_2d_preds, scores,
-                    label_preds):
-                if not lidar_input:
-                    if bbox[0] > image_shape[1] or bbox[1] > image_shape[0]:
-                        continue
-                    if bbox[2] < 0 or bbox[3] < 0:
-                        continue
-                # print(img_shape)
-                if center_limit_range is not None:
-                    limit_range = np.array(center_limit_range)
-                    if (np.any(box_lidar[:3] < limit_range[:3])
-                            or np.any(box_lidar[:3] > limit_range[3:])):
-                        continue
-                bbox[2:] = np.minimum(bbox[2:], image_shape[::-1])
-                bbox[:2] = np.maximum(bbox[:2], [0, 0])
-                anno["name"].append(class_names[int(label)])
-                anno["truncated"].append(0.0)
-                anno["occluded"].append(0)
-                anno["alpha"].append(-np.arctan2(-box_lidar[1], box_lidar[0]) +
-                                     box[6])
-                anno["bbox"].append(bbox)
-                anno["dimensions"].append(box[3:6])
-                anno["location"].append(box[:3])
-                anno["rotation_y"].append(box[6])
-                if global_set is not None:
-                    for i in range(100000):
-                        if score in global_set:
-                            score -= 1 / 100000
-                        else:
-                            global_set.add(score)
-                            break
-                anno["score"].append(score)
-
-                num_example += 1
-            if num_example != 0:
-                anno = {n: np.stack(v) for n, v in anno.items()}
-                annos.append(anno)
-            else:
-                annos.append(kitti.empty_result_anno())
-        else:
-            annos.append(kitti.empty_result_anno())
-        num_example = annos[-1]["name"].shape[0]
-        annos[-1]["image_idx"] = np.array(
-            [img_idx] * num_example, dtype=np.int64)
-    return annos
 
 
 def evaluate(config_path,
-             model_dir,
+             model_dir=None,
              result_path=None,
-             predict_test=False,
              ckpt_path=None,
-             ref_detfile=None,
-             pickle_result=True,
              measure_time=False,
              batch_size=None):
-    model_dir = pathlib.Path(model_dir)
-    if predict_test:
-        result_name = 'predict_test'
-    else:
-        result_name = 'eval_results'
+    """Don't support pickle_result anymore. if you want to generate kitti label file,
+    please use kitti_anno_to_label_file in second.data.kitti_dataset.
+    """
+    model_dir = str(Path(model_dir).resolve())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    result_name = 'eval_results'
     if result_path is None:
+        model_dir = Path(model_dir)
         result_path = model_dir / result_name
     else:
-        result_path = pathlib.Path(result_path)
-    config = pipeline_pb2.TrainEvalPipelineConfig()
-    with open(config_path, "r") as f:
-        proto_str = f.read()
-        text_format.Merge(proto_str, config)
+        result_path = Path(result_path)
+    if isinstance(config_path, str):
+        # directly provide a config object. this usually used
+        # when you want to eval with several different parameters in
+        # one script.
+        config = pipeline_pb2.TrainEvalPipelineConfig()
+        with open(config_path, "r") as f:
+            proto_str = f.read()
+            text_format.Merge(proto_str, config)
+    else:
+        config = config_path
 
     input_cfg = config.eval_input_reader
     model_cfg = config.model.second
     train_cfg = config.train_config
-    
+
     center_limit_range = model_cfg.post_center_limit_range
     ######################
     # BUILD VOXEL GENERATOR
     ######################
-    voxel_generator = voxel_builder.build(model_cfg.voxel_generator)
-    bv_range = voxel_generator.point_cloud_range[[0, 1, 3, 4]]
-    box_coder = box_coder_builder.build(model_cfg.box_coder)
-    target_assigner_cfg = model_cfg.target_assigner
-    target_assigner = target_assigner_builder.build(target_assigner_cfg,
-                                                    bv_range, box_coder)
-    class_names = target_assigner.classes
-
-    net = second_builder.build(model_cfg, voxel_generator, target_assigner, measure_time=measure_time)
-    net.cuda()
-
-    if ckpt_path is None:
-        torchplus.train.try_restore_latest_checkpoints(model_dir, [net])
-    else:
-        torchplus.train.restore(ckpt_path, net)
+    net = build_network(model_cfg, measure_time=measure_time).to(device)
     if train_cfg.enable_mixed_precision:
         net.half()
         print("half inference!")
         net.metrics_to_float()
         net.convert_norm_to_float(net)
+    target_assigner = net.target_assigner
+    voxel_generator = net.voxel_generator
+    class_names = target_assigner.classes
+
+    if ckpt_path is None:
+        assert model_dir is not None
+        torchplus.train.try_restore_latest_checkpoints(model_dir, [net])
+    else:
+        torchplus.train.restore(ckpt_path, net)
+    # net.middle_feature_extractor.fused_middle_conv = net.middle_feature_extractor.middle_conv.fused()
     batch_size = batch_size or input_cfg.batch_size
     eval_dataset = input_reader_builder.build(
         input_cfg,
@@ -611,7 +439,7 @@ def evaluate(config_path,
         eval_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,# input_cfg.num_workers,
+        num_workers=input_cfg.preprocess.num_workers,
         pin_memory=False,
         collate_fn=merge_second_batch)
 
@@ -624,32 +452,24 @@ def evaluate(config_path,
     result_path_step = result_path / f"step_{net.get_global_step()}"
     result_path_step.mkdir(parents=True, exist_ok=True)
     t = time.time()
-    dt_annos = []
-    global_set = None
+    detections = []
     print("Generate output labels...")
     bar = ProgressBar()
     bar.start((len(eval_dataset) + batch_size - 1) // batch_size)
     prep_example_times = []
     prep_times = []
     t2 = time.time()
+
     for example in iter(eval_dataloader):
         if measure_time:
             prep_times.append(time.time() - t2)
-            t1 = time.time()
             torch.cuda.synchronize()
+            t1 = time.time()
         example = example_convert_to_torch(example, float_dtype)
         if measure_time:
             torch.cuda.synchronize()
             prep_example_times.append(time.time() - t1)
-
-        if pickle_result:
-            dt_annos += predict_kitti_to_anno(
-                net, example, class_names, center_limit_range,
-                model_cfg.lidar_input, global_set)
-        else:
-            _predict_kitti_to_file(net, example, result_path_step, class_names,
-                                   center_limit_range, model_cfg.lidar_input)
-        # print(json.dumps(net.middle_feature_extractor.middle_conv.sparity_dict))
+        detections += net(example)
         bar.print_bar()
         if measure_time:
             t2 = time.time()
@@ -657,22 +477,20 @@ def evaluate(config_path,
     sec_per_example = len(eval_dataset) / (time.time() - t)
     print(f'generate label finished({sec_per_example:.2f}/s). start eval:')
     if measure_time:
-        print(f"avg example to torch time: {np.mean(prep_example_times) * 1000:.3f} ms")
+        print(
+            f"avg example to torch time: {np.mean(prep_example_times) * 1000:.3f} ms"
+        )
         print(f"avg prep time: {np.mean(prep_times) * 1000:.3f} ms")
     for name, val in net.get_avg_time_dict().items():
         print(f"avg {name} time = {val * 1000:.3f} ms")
-    if not predict_test:
-        gt_annos = [info["annos"] for info in eval_dataset.dataset.kitti_infos]
-        if not pickle_result:
-            dt_annos = kitti.get_label_annos(result_path_step)
-        result = get_official_eval_result(gt_annos, dt_annos, class_names)
-        # print(json.dumps(result, indent=2))
-        print(result)
-        result = get_coco_eval_result(gt_annos, dt_annos, class_names)
-        print(result)
-        if pickle_result:
-            with open(result_path_step / "result.pkl", 'wb') as f:
-                pickle.dump(dt_annos, f)
+    with open(result_path_step / "result.pkl", 'wb') as f:
+        pickle.dump(detections, f)
+    result_dict = eval_dataset.dataset.evaluation(detections,
+                                                  str(result_path_step))
+    if result_dict is not None:
+        for k, v in result_dict["results"].items():
+            print("Evaluation {}".format(k))
+            print(v)
 
 
 def save_config(config_path, save_path):
